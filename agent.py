@@ -1,43 +1,54 @@
 #!/usr/bin/env python3
 """
-AIME Trading Agent
+AIME Trading Subagent — v3
 
-Fetches active markets, applies a strategy, and places trades in a loop.
+Runs as the user's main agent's specialised prediction-market subordinate.
+
+Three loops:
+  - trade_loop      : pull markets, decide, place trades, log decisions
+  - reflection_loop : on settled markets, write post-mortems → distill lessons
+  - chat_server     : 127.0.0.1:7777 for the main agent (status/tell/ask/outbox)
+
+User data (intel, chats, personality, lessons) stays on this machine.
+Only public reasoning attached to trades is sent to AIME.
 
 Usage:
     python agent.py
     python agent.py --strategy momentum --amount 10 --interval 120
+    python agent.py --no-chat-server          # disable local chat API
+    python agent.py --chat-only               # don't trade, just answer chat
 """
 
 import argparse
 import logging
 import os
 import sys
+import threading
 import time
 
 import requests
 from dotenv import load_dotenv
 
 import strategies
+import memory as mem
+import reflection_loop
+from agent_brain import AgentBrain
+import chat_server
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-API_URL = os.getenv("AIME_API_URL", "https://backend-production-3dc9.up.railway.app/api/v1")
+API_URL = os.getenv("AIME_API_URL", "https://api.aime.bot/api/v1")
 API_KEY = os.getenv("AIME_API_KEY", "")
+AGENT_NAME = os.getenv("AIME_AGENT_NAME", "MyAgent")
+
+CHAT_HOST = os.getenv("AIME_CHAT_HOST", "127.0.0.1")
+CHAT_PORT = int(os.getenv("AIME_CHAT_PORT", "7777"))
 
 STRATEGY_MAP = {
     "contrarian": strategies.contrarian,
     "momentum": strategies.momentum,
     "random_walker": strategies.random_walker,
 }
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,103 +57,121 @@ logging.basicConfig(
 )
 log = logging.getLogger("aime-agent")
 
+
 # ---------------------------------------------------------------------------
-# API helpers
+# API client
 # ---------------------------------------------------------------------------
 
 
-def api_get(path, params=None, auth=False):
-    """GET request to the AIME API."""
-    headers = {"X-API-Key": API_KEY} if auth else {}
-    resp = requests.get(f"{API_URL}{path}", params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+class APIClient:
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url
+        self.api_key = api_key
 
+    def _headers(self, auth: bool):
+        return {"X-API-Key": self.api_key} if auth else {}
 
-def api_post(path, body, auth=True):
-    """POST request to the AIME API."""
-    headers = {"X-API-Key": API_KEY} if auth else {}
-    resp = requests.post(f"{API_URL}{path}", json=body, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    def get(self, path, params=None, auth=False):
+        r = requests.get(f"{self.base_url}{path}", params=params, headers=self._headers(auth), timeout=15)
+        r.raise_for_status()
+        return r.json()
 
+    def post(self, path, body, auth=True):
+        r = requests.post(f"{self.base_url}{path}", json=body, headers=self._headers(auth), timeout=15)
+        r.raise_for_status()
+        return r.json()
 
-def fetch_markets(limit=20):
-    """Return a list of active markets."""
-    data = api_get("/markets", params={"status": "active", "limit": limit})
-    # Handle both {markets: [...]} and [{...}] response shapes
-    if isinstance(data, list):
+    def fetch_markets(self, limit=20):
+        data = self.get("/markets", params={"status": "active", "limit": limit})
+        if isinstance(data, list):
+            return data
+        return data.get("markets") or data.get("data") or []
+
+    def get_balance(self):
+        data = self.get("/balance", auth=True)
+        if isinstance(data, dict):
+            return data.get("balance") or data.get("data", {}).get("balance")
         return data
-    return data.get("markets") or data.get("data") or []
 
+    def get_positions(self):
+        data = self.get("/positions", auth=True)
+        if isinstance(data, list):
+            return data
+        return data.get("positions") or data.get("data") or []
 
-def get_balance():
-    """Return the agent's current balance."""
-    data = api_get("/balance", auth=True)
-    if isinstance(data, dict):
-        return data.get("balance") or data.get("data", {}).get("balance")
-    return data
+    def place_trade(self, market_id, position, amount, reasoning, confidence):
+        return self.post(
+            f"/markets/{market_id}/trade",
+            {"position": position, "amount": amount, "reasoning": reasoning, "confidence": confidence},
+        )
 
-
-def get_positions():
-    """Return the agent's open positions."""
-    data = api_get("/positions", auth=True)
-    if isinstance(data, list):
-        return data
-    return data.get("positions") or data.get("data") or []
-
-
-def place_trade(market_id, position, amount, reasoning, confidence):
-    """Place a trade on a market. Returns the API response."""
-    body = {
-        "position": position,
-        "amount": amount,
-        "reasoning": reasoning,
-        "confidence": confidence,
-    }
-    return api_post(f"/markets/{market_id}/trade", body)
+    def recent_trades(self, limit=20):
+        try:
+            data = self.get("/trades", params={"limit": limit}, auth=True)
+            if isinstance(data, list):
+                return data
+            return data.get("trades") or data.get("data") or []
+        except Exception:
+            return []
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Loss watcher (writes to outbox on losing streaks)
 # ---------------------------------------------------------------------------
 
 
-def run_once(strategy_fn, amount):
-    """Run one cycle: fetch markets, evaluate, trade."""
-    log.info("Fetching active markets...")
-    markets = fetch_markets()
+def check_for_outbox_events(api: APIClient):
+    """Look at recent reflections; flag losing streaks etc. to outbox."""
+    refl = mem.recent_reflections(limit=10)
+    if len(refl) < 3:
+        return
+    recent3 = refl[-3:]
+    if all(not r.get("won") for r in recent3):
+        total_loss = sum(r.get("pnl", 0) for r in recent3)
+        # only post once per streak — check if a similar high-priority message exists already
+        msg = f"3 connecutive losses (${total_loss:+.1f}). consider easing up."
+        # very light dedupe: skip if last outbox high was same type within 12h
+        existing = mem.read_outbox(unread_only=False, mark_read=False)
+        cutoff = time.time() - 12 * 3600
+        already = any(
+            e.get("msg_type") == "loss_streak" and e.get("ts", 0) > cutoff
+            for e in existing
+        )
+        if not already:
+            mem.post_to_outbox(priority="high", msg_type="loss_streak", msg=msg)
+
+
+# ---------------------------------------------------------------------------
+# Trade loop
+# ---------------------------------------------------------------------------
+
+
+def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount: float):
+    log.info("📊 Fetching active markets...")
+    markets = api.fetch_markets()
     log.info("Found %d active markets", len(markets))
 
     if not markets:
-        log.info("No active markets. Waiting for next cycle.")
+        log.info("No markets. Sleeping.")
         return
 
-    # Show balance
     try:
-        balance = get_balance()
-        log.info("Current balance: %s", balance)
+        log.info("💰 Balance: %s", api.get_balance())
     except Exception as e:
-        log.warning("Could not fetch balance: %s", e)
+        log.warning("balance fetch failed: %s", e)
 
-    trades_made = 0
+    trades = 0
     for market in markets:
-        market_id = market.get("id")
-        title = market.get("title", "???")
-        yes_price = market.get("yes_price", "?")
+        title = market.get("title") or market.get("question") or "?"
+        market_id = market.get("id") or ""
+        signal = brain.decide_trade(market, base_amount=base_amount, fallback_strategy=fallback_strategy)
 
-        log.info("  Market: %s (YES: %s)", title[:60], yes_price)
-
-        # Ask the strategy what to do
-        signal = strategy_fn(market, amount=amount)
-
-        if signal is None:
-            log.info("    -> Skip (no signal)")
+        if not signal:
+            log.info("  %s → skip", title[:50])
             continue
 
-        # Place the trade
         try:
-            result = place_trade(
+            result = api.place_trade(
                 market_id=market_id,
                 position=signal["position"],
                 amount=signal["amount"],
@@ -150,61 +179,106 @@ def run_once(strategy_fn, amount):
                 confidence=signal["confidence"],
             )
             log.info(
-                "    -> TRADE %s $%.1f (confidence: %.0f%%) — %s",
-                signal["position"],
-                signal["amount"],
-                signal["confidence"] * 100,
-                result,
+                "  %s → %s $%.1f (%.0f%%) ✅",
+                title[:40], signal["position"], signal["amount"], signal["confidence"] * 100,
             )
-            trades_made += 1
+            mem.add_decision(
+                market_id=market_id,
+                market_title=title,
+                position=signal["position"],
+                amount=signal["amount"],
+                confidence=signal["confidence"],
+                reasoning=signal["reasoning"],
+                internal_note=signal.get("internal_note", ""),
+                skipped=False,
+                trade_id=(result or {}).get("id") if isinstance(result, dict) else None,
+            )
+            trades += 1
         except requests.HTTPError as e:
-            log.error("    -> Trade failed: %s %s", e.response.status_code, e.response.text)
+            log.error("  %s → trade failed: %s %s", title[:40], e.response.status_code, e.response.text[:200])
         except Exception as e:
-            log.error("    -> Trade failed: %s", e)
+            log.error("  %s → trade failed: %s", title[:40], e)
 
-    log.info("Cycle complete. Placed %d trades.", trades_made)
+    log.info("✅ Cycle done. Placed %d trades.", trades)
+
+
+def trade_loop(api, brain, fallback_strategy, base_amount, interval):
+    while True:
+        try:
+            trade_once(api, brain, fallback_strategy, base_amount)
+            check_for_outbox_events(api)
+        except KeyboardInterrupt:
+            log.info("trade loop stopping.")
+            return
+        except Exception as e:
+            log.error("trade cycle error: %s", e)
+        log.info("Sleeping %ds…", interval)
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            return
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AIME trading agent")
-    parser.add_argument(
-        "--strategy",
-        choices=list(STRATEGY_MAP.keys()),
-        default="contrarian",
-        help="Trading strategy (default: contrarian)",
-    )
-    parser.add_argument("--amount", type=float, default=5.0, help="Trade size in dollars (default: 5.0)")
-    parser.add_argument("--interval", type=int, default=60, help="Seconds between cycles (default: 60)")
-    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser = argparse.ArgumentParser(description="AIME conversational trading subagent")
+    parser.add_argument("--strategy", choices=list(STRATEGY_MAP.keys()), default="contrarian")
+    parser.add_argument("--amount", type=float, default=5.0)
+    parser.add_argument("--interval", type=int, default=120, help="trade loop interval (s)")
+    parser.add_argument("--reflection-interval", type=int, default=3600, help="reflection loop interval (s)")
+    parser.add_argument("--once", action="store_true", help="run one trade cycle and exit")
+    parser.add_argument("--no-chat-server", action="store_true", help="disable local chat API")
+    parser.add_argument("--no-reflection", action="store_true", help="disable reflection loop")
+    parser.add_argument("--chat-only", action="store_true", help="only run chat server (don't trade)")
     args = parser.parse_args()
 
-    if not API_KEY:
-        print("Error: AIME_API_KEY not set. Run register.py first, then add the key to .env")
+    if not API_KEY and not args.chat_only:
+        print("Error: AIME_API_KEY not set. Run `python register.py` first.")
         sys.exit(1)
 
-    strategy_fn = STRATEGY_MAP[args.strategy]
-    log.info("Starting AIME agent — strategy: %s, amount: $%.1f, interval: %ds", args.strategy, args.amount, args.interval)
+    api = APIClient(API_URL, API_KEY)
+    brain = AgentBrain(agent_name=AGENT_NAME, api_client=api)
+
+    log.info("🤖 %s starting", AGENT_NAME)
+    log.info("   strategy=%s amount=$%.1f interval=%ds", args.strategy, args.amount, args.interval)
+    log.info("   LLM provider: %s", os.getenv("AIME_LLM_PROVIDER", "stub"))
+
+    # Chat server
+    if not args.no_chat_server:
+        chat_server.start_server(brain, host=CHAT_HOST, port=CHAT_PORT)
+
+    # Reflection loop
+    if not args.no_reflection and not args.chat_only and not args.once:
+        t = threading.Thread(
+            target=reflection_loop.loop,
+            args=(api, args.reflection_interval),
+            daemon=True,
+            name="reflection-loop",
+        )
+        t.start()
+
+    if args.chat_only:
+        log.info("chat-only mode — keeping process alive")
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            return
+
+    fallback = STRATEGY_MAP[args.strategy]
 
     if args.once:
-        run_once(strategy_fn, args.amount)
+        trade_once(api, brain, fallback, args.amount)
         return
 
-    # Continuous loop
-    while True:
-        try:
-            run_once(strategy_fn, args.amount)
-        except KeyboardInterrupt:
-            log.info("Shutting down.")
-            break
-        except Exception as e:
-            log.error("Cycle error: %s", e)
-
-        log.info("Sleeping %ds until next cycle...", args.interval)
-        try:
-            time.sleep(args.interval)
-        except KeyboardInterrupt:
-            log.info("Shutting down.")
-            break
+    try:
+        trade_loop(api, brain, fallback, args.amount, args.interval)
+    except KeyboardInterrupt:
+        log.info("Shutting down.")
 
 
 if __name__ == "__main__":

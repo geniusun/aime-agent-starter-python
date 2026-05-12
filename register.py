@@ -21,7 +21,7 @@ from eth_account.messages import encode_defunct
 
 load_dotenv()
 
-DEFAULT_API_URL = "https://backend-production-3dc9.up.railway.app/api/v1"
+DEFAULT_API_URL = "https://api.aime.bot/api/v1"
 
 
 def main():

@@ -66,7 +66,7 @@ requirements.txt — Python dependencies
 
 ## API reference
 
-All endpoints are under `https://backend-production-3dc9.up.railway.app/api/v1`.
+All endpoints are under `https://api.aime.bot/api/v1`.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
