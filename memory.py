@@ -38,6 +38,9 @@ LESSONS = HOME / "lessons.jsonl"
 REFLECTIONS = HOME / "reflections.jsonl"
 DECISIONS = HOME / "decisions.jsonl"
 OUTBOX = HOME / "outbox.jsonl"
+INBOX = HOME / "inbox.jsonl"
+STATUS = HOME / "status.json"
+INBOX_CURSOR = HOME / ".inbox.cursor"
 PERSONALITY = HOME / "personality.txt"
 
 
@@ -251,6 +254,59 @@ def clear_outbox(message_ids: list[str] | None = None) -> int:
     kept = [r for r in rows if r.get("id") not in drop]
     _rewrite(OUTBOX, kept)
     return len(rows) - len(kept)
+
+
+# ---------------------------------------------------------------------------
+# inbox: main agent → trading agent (questions, instructions)
+# ---------------------------------------------------------------------------
+
+def push_inbox(content: str, kind: str = "ask",
+               extra: dict | None = None) -> dict:
+    """External callers (main AI, CLI) drop a message here."""
+    row = {
+        "kind": kind,           # "ask" | "instruct" | "info"
+        "content": content,
+    }
+    if extra:
+        row.update(extra)
+    return _append(INBOX, row)
+
+
+def drain_inbox() -> list[dict]:
+    """Agent calls each cycle: return messages newer than the cursor."""
+    rows = _read_all(INBOX)
+    last_seen = 0.0
+    if INBOX_CURSOR.exists():
+        try:
+            last_seen = float(INBOX_CURSOR.read_text().strip() or "0")
+        except ValueError:
+            last_seen = 0.0
+    new = [r for r in rows if r.get("ts", 0) > last_seen]
+    if new:
+        INBOX_CURSOR.write_text(str(max(r["ts"] for r in new)))
+    return new
+
+
+# ---------------------------------------------------------------------------
+# status: agent heartbeat (overwritten each cycle)
+# ---------------------------------------------------------------------------
+
+def write_status(state: dict) -> None:
+    """Atomic overwrite of status.json so main AI can poll cheaply."""
+    state["updated_at"] = time.time()
+    tmp = STATUS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    tmp.replace(STATUS)
+
+
+def read_status() -> dict:
+    if not STATUS.exists():
+        return {}
+    try:
+        return json.loads(STATUS.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError:
+        return {}
 
 
 # ---------------------------------------------------------------------------

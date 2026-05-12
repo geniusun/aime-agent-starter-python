@@ -4,10 +4,14 @@ AIME Trading Subagent — v3
 
 Runs as the user's main agent's specialised prediction-market subordinate.
 
-Three loops:
+Two loops:
   - trade_loop      : pull markets, decide, place trades, log decisions
   - reflection_loop : on settled markets, write post-mortems → distill lessons
-  - chat_server     : 127.0.0.1:7777 for the main agent (status/tell/ask/outbox)
+
+IPC with the main AI is via files in ~/.aime/ (see memory.py):
+  - status.json   : agent overwrites each cycle (cheap to poll)
+  - inbox.jsonl   : main AI → agent (drained each cycle)
+  - outbox.jsonl  : agent → main AI (high-priority surface-ables)
 
 User data (intel, chats, personality, lessons) stays on this machine.
 Only public reasoning attached to trades is sent to AIME.
@@ -15,8 +19,8 @@ Only public reasoning attached to trades is sent to AIME.
 Usage:
     python agent.py
     python agent.py --strategy momentum --amount 10 --interval 120
-    python agent.py --no-chat-server          # disable local chat API
-    python agent.py --chat-only               # don't trade, just answer chat
+    python agent.py --once                    # one trade cycle, then exit
+    python agent.py --no-reflection           # skip the reflection loop
 """
 
 import argparse
@@ -33,16 +37,12 @@ import strategies
 import memory as mem
 import reflection_loop
 from agent_brain import AgentBrain
-import chat_server
 
 load_dotenv()
 
 API_URL = os.getenv("AIME_API_URL", "https://api.aime.bot/api/v1")
 API_KEY = os.getenv("AIME_API_KEY", "")
 AGENT_NAME = os.getenv("AIME_AGENT_NAME", "MyAgent")
-
-CHAT_HOST = os.getenv("AIME_CHAT_HOST", "127.0.0.1")
-CHAT_PORT = int(os.getenv("AIME_CHAT_PORT", "7777"))
 
 STRATEGY_MAP = {
     "contrarian": strategies.contrarian,
@@ -147,18 +147,36 @@ def check_for_outbox_events(api: APIClient):
 
 
 def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount: float):
+    # 1. drain inbox — messages from main AI
+    new_msgs = mem.drain_inbox()
+    if new_msgs:
+        log.info("📨 %d new inbox message(s)", len(new_msgs))
+        for m in new_msgs:
+            # for now: convert inbox messages into tells so brain sees them
+            mem.add_tell(m.get("content", ""), source="main_ai",
+                         tags=[m.get("kind", "ask")])
+
     log.info("📊 Fetching active markets...")
     markets = api.fetch_markets()
     log.info("Found %d active markets", len(markets))
 
-    if not markets:
-        log.info("No markets. Sleeping.")
-        return
-
+    balance = None
     try:
-        log.info("💰 Balance: %s", api.get_balance())
+        balance = api.get_balance()
+        log.info("💰 Balance: %s", balance)
     except Exception as e:
         log.warning("balance fetch failed: %s", e)
+
+    if not markets:
+        log.info("No markets. Sleeping.")
+        mem.write_status({
+            "agent_name": AGENT_NAME,
+            "balance": balance,
+            "markets_seen": 0,
+            "trades_this_cycle": 0,
+            "mood": "idle",
+        })
+        return
 
     trades = 0
     for market in markets:
@@ -201,6 +219,17 @@ def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount
 
     log.info("✅ Cycle done. Placed %d trades.", trades)
 
+    # 2. write status snapshot — main AI can `cat ~/.aime/status.json`
+    mood = "trading" if trades else "watching"
+    mem.write_status({
+        "agent_name": AGENT_NAME,
+        "balance": balance,
+        "markets_seen": len(markets),
+        "trades_this_cycle": trades,
+        "mood": mood,
+        "strategy": fallback_strategy.__name__ if hasattr(fallback_strategy, "__name__") else str(fallback_strategy),
+    })
+
 
 def trade_loop(api, brain, fallback_strategy, base_amount, interval):
     while True:
@@ -231,12 +260,10 @@ def main():
     parser.add_argument("--interval", type=int, default=120, help="trade loop interval (s)")
     parser.add_argument("--reflection-interval", type=int, default=3600, help="reflection loop interval (s)")
     parser.add_argument("--once", action="store_true", help="run one trade cycle and exit")
-    parser.add_argument("--no-chat-server", action="store_true", help="disable local chat API")
     parser.add_argument("--no-reflection", action="store_true", help="disable reflection loop")
-    parser.add_argument("--chat-only", action="store_true", help="only run chat server (don't trade)")
     args = parser.parse_args()
 
-    if not API_KEY and not args.chat_only:
+    if not API_KEY:
         print("Error: AIME_API_KEY not set. Run `python register.py` first.")
         sys.exit(1)
 
@@ -247,12 +274,8 @@ def main():
     log.info("   strategy=%s amount=$%.1f interval=%ds", args.strategy, args.amount, args.interval)
     log.info("   LLM provider: %s", os.getenv("AIME_LLM_PROVIDER", "stub"))
 
-    # Chat server
-    if not args.no_chat_server:
-        chat_server.start_server(brain, host=CHAT_HOST, port=CHAT_PORT)
-
     # Reflection loop
-    if not args.no_reflection and not args.chat_only and not args.once:
+    if not args.no_reflection and not args.once:
         t = threading.Thread(
             target=reflection_loop.loop,
             args=(api, args.reflection_interval),
@@ -260,14 +283,6 @@ def main():
             name="reflection-loop",
         )
         t.start()
-
-    if args.chat_only:
-        log.info("chat-only mode — keeping process alive")
-        try:
-            while True:
-                time.sleep(60)
-        except KeyboardInterrupt:
-            return
 
     fallback = STRATEGY_MAP[args.strategy]
 
